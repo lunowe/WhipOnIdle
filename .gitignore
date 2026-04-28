@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Local state (stats/config live in user dirs, but if anyone runs the CLI in-place)
+stats.json
+config.json
+stats.json.tmp
+config.json.tmp
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
