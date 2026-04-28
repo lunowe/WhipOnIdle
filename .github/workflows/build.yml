@@ -20,6 +20,12 @@ jobs:
             zip: WhipOnIdle-windows.zip
     runs-on: ${{ matrix.os }}
 
+    permissions:
+      # Needed by softprops/action-gh-release to upload the zip as a release
+      # asset. Without this, GITHUB_TOKEN is read-only for `contents` and the
+      # upload fails with "Resource not accessible by integration".
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
 
