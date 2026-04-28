@@ -574,6 +574,7 @@ def default_config() -> dict:
         "headline": "ZURÜCK AN DIE ARBEIT!",
         "dismiss_hint": "(beliebige Taste zum Schließen)",
         "voice": "Anna" if IS_MAC else "",
+        "sound": "",  # path to a custom .wav/.mp3; empty → bundled default
         "suppress_when": "frontmost",
         "meeting_apps": list(DEFAULT_MEETING_APPS),
         "paused": False,
@@ -912,10 +913,22 @@ class Watcher:
                     )
                     self._emit("whipped", {"idle": idle})
                     armed = False
-                    while not self._stop_event.is_set() and get_idle_seconds() >= 5:
-                        if self._interruptible_sleep(1.0):
+                    # If the user keeps idling, whip again once another
+                    # full idle interval has elapsed — don't just wait
+                    # for activity. If they do wake up during the wait,
+                    # honor the cooldown as a grace period.
+                    deadline = time.time() + idle_threshold
+                    became_active = False
+                    while not self._stop_event.is_set():
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            break
+                        if get_idle_seconds() < 5:
+                            became_active = True
+                            break
+                        if self._interruptible_sleep(min(poll, remaining)):
                             return
-                    if self._interruptible_sleep(cooldown):
+                    if became_active and self._interruptible_sleep(cooldown):
                         return
                     armed = True
 

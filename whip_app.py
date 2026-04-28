@@ -25,6 +25,7 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # Lazy-imported so --help/--stats/--test still work without pystray installed:
 #   pystray, PIL.Image, PIL.ImageDraw
@@ -165,6 +166,102 @@ def show_message_box(title: str, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Input dialogs (modal, blocking — call from a worker thread, not the tray loop)
+# ---------------------------------------------------------------------------
+def prompt_text(title: str, prompt: str, default: str = "") -> str | None:
+    """Modal single-line text input. Returns the entered string, or None on cancel."""
+    if IS_MAC:
+        safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+        safe_prompt = prompt.replace("\\", "\\\\").replace('"', '\\"')
+        safe_default = default.replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            f'display dialog "{safe_prompt}" with title "{safe_title}" '
+            f'default answer "{safe_default}" '
+            f'buttons {{"Abbrechen", "OK"}} '
+            f'default button "OK" cancel button "Abbrechen"'
+        )
+        try:
+            out = subprocess.check_output(
+                ["osascript", "-e", script],
+                text=True, stderr=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            return None  # user cancelled
+        # osascript output: "button returned:OK, text returned:<value>\n"
+        marker = "text returned:"
+        idx = out.find(marker)
+        if idx == -1:
+            return None
+        return out[idx + len(marker):].rstrip("\r\n")
+    if IS_WINDOWS:
+        # Tk inline: pystray on Windows doesn't conflict with a fresh Tk root,
+        # as long as we create + destroy it on the same thread.
+        import tkinter as tk
+        from tkinter import simpledialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            return simpledialog.askstring(
+                title, prompt, initialvalue=default, parent=root,
+            )
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+    return None
+
+
+def prompt_open_file(title: str, extensions: list[str] | None = None) -> str | None:
+    """Modal open-file dialog. Returns absolute path, or None on cancel.
+
+    `extensions` is a list of file extensions without the dot, e.g. ["wav", "mp3"].
+    """
+    extensions = extensions or []
+    if IS_MAC:
+        # AppleScript `choose file` filters by uniform-type identifier or extension.
+        type_clause = ""
+        if extensions:
+            quoted = ", ".join(f'"{e}"' for e in extensions)
+            type_clause = f" of type {{{quoted}}}"
+        safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            f'POSIX path of (choose file with prompt "{safe_title}"{type_clause})'
+        )
+        try:
+            out = subprocess.check_output(
+                ["osascript", "-e", script],
+                text=True, stderr=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            return None  # user cancelled
+        return out.strip() or None
+    if IS_WINDOWS:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            filetypes: list[tuple[str, str]] = []
+            if extensions:
+                pattern = " ".join(f"*.{e}" for e in extensions)
+                filetypes.append(("Audio", pattern))
+            filetypes.append(("Alle Dateien", "*.*"))
+            path = filedialog.askopenfilename(
+                title=title, parent=root, filetypes=filetypes,
+            )
+            return path or None
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Tray app
 # ---------------------------------------------------------------------------
 IDLE_PRESETS = [
@@ -228,6 +325,44 @@ class WhipTrayApp:
                 self.icon.update_menu()
         return _action
 
+    def _apply_config_change(self, **changes) -> None:
+        """Persist config + push to watcher + refresh menu. Thread-safe."""
+        self.config.update(changes)
+        save_config(self.config)
+        self.watcher.update_config(**changes)
+        if self.icon:
+            try:
+                self.icon.update_menu()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _set_sound(self, path: str):
+        def _action(_icon=None, _item=None):
+            self._apply_config_change(sound=path)
+        return _action
+
+    def _pick_custom_sound(self, _icon=None, _item=None) -> None:
+        # Run the file picker off the tray thread so the menu can dismiss.
+        def _do() -> None:
+            path = prompt_open_file(
+                "Peitschen-Sound auswählen",
+                extensions=["wav", "mp3"],
+            )
+            if path:
+                self._apply_config_change(sound=path)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _edit_text(self, key: str, title: str, prompt: str):
+        """Returns a menu action that opens an input dialog for `config[key]`."""
+        def _action(_icon=None, _item=None):
+            def _do() -> None:
+                current = self.config.get(key, "")
+                new = prompt_text(title, prompt, default=current)
+                if new is not None:
+                    self._apply_config_change(**{key: new})
+            threading.Thread(target=_do, daemon=True).start()
+        return _action
+
     def _test_whip(self, _icon=None, _item=None) -> None:
         # Reuse the watcher's subprocess invocation so behaviour matches a
         # real fire (same args, same animation/sound/voice).
@@ -275,6 +410,56 @@ class WhipTrayApp:
             for label, mode in SUPPRESS_PRESETS
         ]
 
+        # Sound submenu: "Standard" + currently-picked custom + file picker.
+        sound_items = [
+            MenuItem(
+                "Standard",
+                self._set_sound(""),
+                checked=lambda _i: not self.config.get("sound"),
+                radio=True,
+            )
+        ]
+        custom_sound = self.config.get("sound", "")
+        if custom_sound:
+            sound_items.append(
+                MenuItem(
+                    Path(custom_sound).name or custom_sound,
+                    self._set_sound(custom_sound),  # re-selects, effectively no-op
+                    checked=lambda _i: bool(self.config.get("sound")),
+                    radio=True,
+                )
+            )
+        sound_items.append(Menu.SEPARATOR)
+        sound_items.append(MenuItem("Eigene Datei wählen…", self._pick_custom_sound))
+
+        # Texts submenu: edit the spoken phrase, the visual headline, and the hint.
+        text_items = [
+            MenuItem(
+                "Nachricht ändern…",
+                self._edit_text(
+                    "message",
+                    "WhipOnIdle: Nachricht",
+                    "Gesprochene Nachricht beim Peitschenhieb:",
+                ),
+            ),
+            MenuItem(
+                "Überschrift ändern…",
+                self._edit_text(
+                    "headline",
+                    "WhipOnIdle: Überschrift",
+                    "Große Überschrift im Whip-Overlay:",
+                ),
+            ),
+            MenuItem(
+                "Hinweistext ändern…",
+                self._edit_text(
+                    "dismiss_hint",
+                    "WhipOnIdle: Hinweistext",
+                    "Kleiner Hinweistext unter der Überschrift:",
+                ),
+            ),
+        ]
+
         # Header line — disabled, just shows status + count
         status_emoji = "⏸" if paused else "🟢"
         header = f"{status_emoji}  {whips_today} Hiebe heute"
@@ -293,6 +478,8 @@ class WhipTrayApp:
             ),
             MenuItem("Idle-Schwelle", Menu(*idle_items)),
             MenuItem("Meeting-Unterdrückung", Menu(*suppress_items)),
+            MenuItem("Peitschen-Sound", Menu(*sound_items)),
+            MenuItem("Texte anpassen", Menu(*text_items)),
             Menu.SEPARATOR,
             MenuItem("Test Peitsche", self._test_whip),
             MenuItem("Statistik anzeigen…", self._show_stats),
