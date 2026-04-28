@@ -256,7 +256,7 @@ def ensure_whip_sound(custom: Path | None) -> Path | None:
         return custom if custom.exists() else None
 
     if IS_WINDOWS:
-        candidates = [BUNDLED_WAV, BUNDLED_MP3]
+        candidates = [BUNDLED_MP3, BUNDLED_WAV]
     else:
         candidates = [BUNDLED_MP3, BUNDLED_WAV]
     for c in candidates:
