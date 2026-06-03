@@ -47,19 +47,28 @@ from whip_on_idle import (
 # Tray icon graphic — a simple whip drawn with PIL
 # ---------------------------------------------------------------------------
 def make_icon_image(size: int = 128):
-    """Return a PIL.Image of a stylized whip on transparent background."""
+    """Return a PIL.Image of a stylized whip on a transparent background.
+
+    Rendered at 4× and downsampled with LANCZOS so the curves and the star
+    come out smoothly anti-aliased at any tray size.
+    """
     from PIL import Image, ImageDraw
 
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    ss = 4                      # supersampling factor
+    big = size * ss
+    img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
-    s = size / 64.0  # scale factor
+    s = big / 64.0              # scale factor (coords stay in a 64-unit grid)
 
-    # Handle (lower-left): leather-brown rounded rectangle
-    handle_color = (110, 70, 30, 255)
+    # Handle (lower-left): leather-brown rounded rectangle with a soft highlight.
     d.rounded_rectangle(
         [8 * s, 38 * s, 22 * s, 56 * s],
-        radius=int(3 * s), fill=handle_color,
+        radius=int(3 * s), fill=(120, 78, 34, 255),
+    )
+    d.rounded_rectangle(
+        [9.5 * s, 39.5 * s, 13 * s, 55 * s],
+        radius=int(2 * s), fill=(150, 100, 48, 255),
     )
     # Handle wrap (a couple of darker stripes)
     for y in (42, 47, 52):
@@ -70,39 +79,47 @@ def make_icon_image(size: int = 128):
 
     # Lash: curve sweeping up-and-right with tapering width
     points: list[tuple[float, float]] = []
-    for i in range(40):
-        t = i / 39
+    for i in range(48):
+        t = i / 47
         # Bezier-ish curve from (22, 42) up to (58, 8)
         x = 22 * s + t * 36 * s
         y = 42 * s - t * 30 * s + 4 * s * math.sin(t * math.pi * 2.5)
         points.append((x, y))
+
+    # Dark underlay first for a touch of depth, then the graded lash on top.
+    for i in range(len(points) - 1):
+        f = i / (len(points) - 1)
+        width = max(1, int((6.0 - 4.0 * f) * s))
+        d.line([points[i], points[i + 1]], fill=(40, 24, 10, 180), width=width)
 
     for i in range(len(points) - 1):
         f = i / (len(points) - 1)
         width = max(1, int((4.5 - 3.5 * f) * s))
         # Color: brown near handle, lighter brown to cream at tip
         if f < 0.5:
-            color = (160, 105, 45, 255)
+            color = (165, 108, 46, 255)
         elif f < 0.85:
-            color = (210, 165, 90, 255)
+            color = (215, 168, 92, 255)
         else:
-            color = (255, 240, 200, 255)
+            color = (255, 242, 205, 255)
         d.line([points[i], points[i + 1]], fill=color, width=width)
 
-    # Crack: bright yellow star at the tip
-    tip = points[-1]
-    cx, cy = tip
+    # Crack: a soft warm glow under a bright yellow star at the tip.
+    cx, cy = points[-1]
+    for r, alpha in ((11, 60), (7, 110)):
+        rr = r * s
+        d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=(255, 225, 120, alpha))
+
     star_r = 7 * s
     inner_r = 3 * s
-    star_color = (255, 220, 80, 255)
     star_pts: list[tuple[float, float]] = []
     for k in range(10):
         ang = -math.pi / 2 + k * math.pi / 5
         r = star_r if k % 2 == 0 else inner_r
         star_pts.append((cx + math.cos(ang) * r, cy + math.sin(ang) * r))
-    d.polygon(star_pts, fill=star_color, outline=(255, 255, 255, 255))
+    d.polygon(star_pts, fill=(255, 224, 86, 255), outline=(255, 255, 255, 255))
 
-    return img
+    return img.resize((size, size), Image.LANCZOS)
 
 
 # ---------------------------------------------------------------------------
@@ -120,11 +137,13 @@ def format_stats_text(stats: dict) -> str:
     whips_week = [e for e in whips if _parse_ts(e) >= week_ago]
 
     lines = [
-        f"Aufzeichnung seit: {stats.get('started_first', '?')}",
-        f"Peitschenhiebe gesamt: {len(whips)}",
-        f"Heute: {len(whips_today_list)}",
-        f"Letzte 7 Tage: {len(whips_week)}",
-        f"Unterdrückt: {len(suppressed)} (Meeting/disarmed)",
+        "🐎  WhipOnIdle — Statistik",
+        f"     seit {stats.get('started_first', '?')}",
+        "",
+        f"💥  Peitschenhiebe gesamt:  {len(whips)}",
+        f"📅  Heute:                  {len(whips_today_list)}",
+        f"🗓  Letzte 7 Tage:          {len(whips_week)}",
+        f"🤫  Unterdrückt:            {len(suppressed)}  (Meeting / pausiert)",
     ]
     if whips:
         hours = Counter(_parse_ts(e).hour for e in whips)
@@ -133,14 +152,14 @@ def format_stats_text(stats: dict) -> str:
         last = _parse_ts(whips[-1])
         lines += [
             "",
-            f"Schlimmste Stunde: {top_hour:02d}:00–{top_hour:02d}:59 ({top_count}×)",
-            f"Ø Idle bei Hieb: {avg_idle:.0f}s",
-            f"Letzter Hieb: {last.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"🕒  Schlimmste Stunde:  {top_hour:02d}:00–{top_hour:02d}:59  ({top_count}×)",
+            f"⏱  Ø Idle bei Hieb:    {avg_idle:.0f}s",
+            f"🔚  Letzter Hieb:       {last.strftime('%Y-%m-%d %H:%M:%S')}",
         ]
     if suppressed:
         reasons = Counter(e.get("reason", "?") for e in suppressed)
         top = ", ".join(f"{r} ×{c}" for r, c in reasons.most_common(3))
-        lines += ["", f"Top-Unterdrückungen: {top}"]
+        lines += ["", f"🛑  Top-Unterdrückungen:  {top}"]
     return "\n".join(lines)
 
 

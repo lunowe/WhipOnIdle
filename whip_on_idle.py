@@ -606,9 +606,18 @@ def save_config(cfg: dict) -> None:
 # Whip animation — Tk overlay (works on macOS + Windows)
 # ---------------------------------------------------------------------------
 class WhipAnimation:
-    """Borderless top-most overlay that draws a whip cracking across the screen."""
+    """Borderless top-most overlay that draws a whip cracking across the screen.
 
-    DURATION_MS = 950
+    Cinematic dressing: a soft radial spotlight, glowing/​shadowed typography,
+    a tapered motion-blurred lash, an impact flash with radiating sparks, a
+    brief screen-shake on the crack, and an alpha fade in/out — all drawn with
+    stdlib Tk only (no external image libraries).
+    """
+
+    DURATION_MS = 1000      # whip travel time
+    FADE_IN_MS = 140        # alpha ramp at the start
+    TARGET_ALPHA = 0.93     # peak overlay opacity
+    BG = "#070709"          # near-black, faintly cool
 
     def __init__(
         self,
@@ -623,34 +632,296 @@ class WhipAnimation:
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.w}x{self.h}+0+0")
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.88)
-        self.root.configure(bg="black")
+        try:
+            self.root.attributes("-alpha", 0.0)  # fade in from transparent
+        except tk.TclError:
+            pass
+        self.root.configure(bg=self.BG)
 
         self.canvas = tk.Canvas(
             self.root,
             width=self.w, height=self.h,
-            bg="black", highlightthickness=0, cursor="none",
+            bg=self.BG, highlightthickness=0, cursor="none",
         )
         self.canvas.pack(fill="both", expand=True)
 
-        self.canvas.create_text(
-            self.w / 2, self.h * 0.16,
-            text=message_top, fill="#ff2a2a",
-            font=("Helvetica", 96, "bold"),
-        )
-        self.canvas.create_text(
-            self.w / 2, self.h * 0.16 + 90,
-            text=dismiss_hint, fill="#888888",
-            font=("Helvetica", 18),
-        )
-
         self._whip_items: list[int] = []
+        self._shake_items: list[int] = []   # static items that jolt on impact
+        self._cur_shake = (0.0, 0.0)
+        self._cur_head_col: str | None = None
+        self._closed = False
+        self._closing = False
+
+        # Where the lash tip is at the moment of the crack (t≈0.5) — sparks and
+        # the flash burst radiate from this fixed point even as the tip flies on.
+        self._crack_x = -160 + (self.w + 320) * 0.5
+        self._crack_y = self.h * 0.55 + self.h * 0.045
+
+        self._draw_background()
+        self._headline_core = self._build_text(message_top, dismiss_hint)
+
         self._start_time = time.time()
         self.root.bind("<Key>", lambda _e: self._close())
         self.root.bind("<Button>", lambda _e: self._close())
-        self._closed = False
 
-    def _close(self) -> None:
+    # ----- helpers -----
+    def _pick_font(
+        self, preferred: list[str], size: int, weight: str = "normal"
+    ) -> tuple[str, int, str]:
+        """First installed family from `preferred`, else the last as fallback."""
+        from tkinter import font as tkfont
+        try:
+            available = {f.lower() for f in tkfont.families(self.root)}
+        except tk.TclError:
+            available = set()
+        for name in preferred:
+            if name.lower() in available:
+                return (name, size, weight)
+        return (preferred[-1], size, weight)
+
+    @staticmethod
+    def _interp(
+        c1: tuple[int, int, int], c2: tuple[int, int, int], f: float
+    ) -> str:
+        r = int(round(c1[0] + (c2[0] - c1[0]) * f))
+        g = int(round(c1[1] + (c2[1] - c1[1]) * f))
+        b = int(round(c1[2] + (c2[2] - c1[2]) * f))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_background(self) -> None:
+        """Soft radial spotlight behind the action — drawn once, persists."""
+        cx, cy = self.w / 2, self.h * 0.4
+        max_r = max(self.w, self.h) * 0.8
+        edge = (7, 7, 9)
+        core = (26, 25, 34)
+        steps = 26
+        for i in range(steps):
+            f = i / (steps - 1)
+            r = max_r * (1 - f)
+            self.canvas.create_oval(
+                cx - r, cy - r * 0.78, cx + r, cy + r * 0.78,
+                fill=self._interp(edge, core, f), outline="",
+            )
+
+    def _glow_text(
+        self, x: float, y: float, text: str, font: tuple,
+        core: str, inner: str, outer: str, shadow: str,
+    ) -> int:
+        """Draw text as drop-shadow + two-ring glow + crisp core. Returns core id."""
+        ids: list[int] = [
+            self.canvas.create_text(x + 3, y + 6, text=text, fill=shadow, font=font)
+        ]
+        for dx, dy in ((-7, 0), (7, 0), (0, -7), (0, 7),
+                       (-5, 5), (5, 5), (-5, -5), (5, -5)):
+            ids.append(self.canvas.create_text(
+                x + dx, y + dy, text=text, fill=outer, font=font))
+        for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3),
+                       (-2, -2), (2, 2), (-2, 2), (2, -2)):
+            ids.append(self.canvas.create_text(
+                x + dx, y + dy, text=text, fill=inner, font=font))
+        core_id = self.canvas.create_text(x, y, text=text, fill=core, font=font)
+        ids.append(core_id)
+        self._shake_items.extend(ids)
+        return core_id
+
+    def _build_text(self, headline: str, hint: str) -> int:
+        size_h = max(58, int(self.w * 0.072))
+        font_h = self._pick_font(
+            ["Arial Black", "Helvetica Neue", "Helvetica", "Arial"],
+            size_h, "bold",
+        )
+        hx, hy = self.w / 2, self.h * 0.2
+        core = self._glow_text(
+            hx, hy, headline, font_h,
+            core="#ff4d4d", inner="#b81818", outer="#5e0c0c", shadow="#000000",
+        )
+
+        # Accent underline beneath the headline.
+        uw = min(self.w * 0.46, max(self.w * 0.18, size_h * len(headline) * 0.30))
+        uy = hy + size_h * 0.62
+        self._shake_items.append(self.canvas.create_line(
+            hx - uw, uy, hx + uw, uy,
+            fill="#7a1414", width=max(2, int(size_h * 0.03)), capstyle="round",
+        ))
+
+        # Dismiss hint (with a soft shadow for legibility on any wallpaper).
+        size_hint = max(15, int(self.w * 0.0125))
+        font_hint = self._pick_font(
+            ["Helvetica Neue", "Helvetica", "Arial"], size_hint)
+        hy2 = hy + size_h * 0.92
+        self._shake_items.append(self.canvas.create_text(
+            hx + 1, hy2 + 2, text=hint, fill="#000000", font=font_hint))
+        self._shake_items.append(self.canvas.create_text(
+            hx, hy2, text=hint, fill="#9a9aa6", font=font_hint))
+        return core
+
+    # ----- per-frame motion -----
+    def _compute_shake(self, t: float) -> tuple[float, float]:
+        """Decaying jolt around the crack; settles back to (0, 0)."""
+        if 0.44 < t < 0.66:
+            p = (t - 0.44) / 0.22
+            mag = 18 * (1 - p)
+            return (math.sin(t * 97.0) * mag, math.cos(t * 131.0) * mag * 0.55)
+        return (0.0, 0.0)
+
+    def _apply_shake(self, sx: float, sy: float) -> None:
+        dx = sx - self._cur_shake[0]
+        dy = sy - self._cur_shake[1]
+        if abs(dx) >= 0.5 or abs(dy) >= 0.5:
+            for item in self._shake_items:
+                self.canvas.move(item, dx, dy)
+            self._cur_shake = (sx, sy)
+
+    def _flash_headline(self, t: float) -> None:
+        col = "#fff0f0" if 0.47 < t < 0.6 else "#ff4d4d"
+        if col != self._cur_head_col:
+            try:
+                self.canvas.itemconfigure(self._headline_core, fill=col)
+            except tk.TclError:
+                pass
+            self._cur_head_col = col
+
+    def _draw_whip(self, t: float, sx: float, sy: float) -> None:
+        for item in self._whip_items:
+            self.canvas.delete(item)
+        self._whip_items.clear()
+        add = self._whip_items.append
+
+        head_x = -160 + (self.w + 320) * t + sx
+        head_y = self.h * 0.55 + math.sin(t * math.pi) * (self.h * 0.045) + sy
+        tail_length = self.w * 0.6
+
+        segs = 56
+        pts: list[tuple[float, float]] = []
+        for i in range(segs + 1):
+            f = i / segs
+            amp = (1 - t) * 95 + f * 135
+            phase = f * 6.5 + t * 9.5
+            x = head_x - tail_length * f
+            y = head_y + amp * math.sin(phase)
+            pts.append((x, y))
+
+        flat = [c for p in pts for c in p]
+
+        # Outer + inner glow, then a trailing motion-blur ghost — single smooth
+        # polylines, cheap to draw.
+        add(self.canvas.create_line(
+            *flat, width=24, fill="#3c2a12",
+            capstyle="round", joinstyle="round", smooth=True))
+        add(self.canvas.create_line(
+            *flat, width=12, fill="#6b4a1c",
+            capstyle="round", joinstyle="round", smooth=True))
+        gflat = [c for (x, y) in pts for c in (x - 34, y)]
+        add(self.canvas.create_line(
+            *gflat, width=9, fill="#241a0c",
+            capstyle="round", joinstyle="round", smooth=True))
+
+        # Main lash: tapered, colour-graded from molten tip to leather base.
+        for i in range(segs):
+            x1, y1 = pts[i]
+            x2, y2 = pts[i + 1]
+            f = i / segs
+            width = max(1, 15 * (1 - f) + 2)
+            if f < 0.04:
+                color = "#fffdf4"
+            elif f < 0.16:
+                color = "#ffe7b2"
+            elif f < 0.5:
+                color = "#d8a85a"
+            else:
+                color = "#7c4e1c"
+            add(self.canvas.create_line(
+                x1, y1, x2, y2, width=width, fill=color, capstyle="round"))
+
+        # Bright specular streak along the fast tip + a glowing tip dot.
+        tip_n = max(4, segs // 4)
+        add(self.canvas.create_line(
+            *[c for p in pts[:tip_n] for c in p],
+            width=3, fill="#fffaf0", capstyle="round", smooth=True))
+        tx, ty = pts[0]
+        for r, col in ((11, "#fff4cf"), (5, "#ffffff")):
+            add(self.canvas.create_oval(
+                tx - r, ty - r, tx + r, ty + r, fill=col, outline=""))
+
+        self._draw_impact(t)
+
+    def _draw_impact(self, t: float) -> None:
+        add = self._whip_items.append
+        cx, cy = self._crack_x, self._crack_y
+
+        # Crack flash: screen tint + halo burst + radiating spokes.
+        if 0.46 < t < 0.66:
+            fp = (t - 0.46) / 0.20
+            add(self.canvas.create_rectangle(
+                0, 0, self.w, self.h, fill="#ff3326", outline="", stipple="gray12"))
+            if t < 0.54:
+                add(self.canvas.create_rectangle(
+                    0, 0, self.w, self.h, fill="#ffffff", outline="",
+                    stipple="gray12"))
+            for r, col, stip in ((150, "#ffd86a", "gray50"),
+                                 (80, "#fff3c0", "gray25"),
+                                 (34, "#ffffff", "")):
+                fr = r * (0.65 + fp * 1.15)
+                add(self.canvas.create_oval(
+                    cx - fr, cy - fr, cx + fr, cy + fr,
+                    fill=col, outline="", stipple=stip))
+            for ang_deg in range(0, 360, 22):
+                ang = math.radians(ang_deg)
+                r1 = 70 + fp * 70
+                r2 = 175 + fp * 170
+                add(self.canvas.create_line(
+                    cx + math.cos(ang) * r1, cy + math.sin(ang) * r1,
+                    cx + math.cos(ang) * r2, cy + math.sin(ang) * r2,
+                    width=3, fill="#ffe680"))
+
+        # Sparks flung outward from the crack point, cooling as they fly.
+        if 0.5 <= t < 0.92:
+            sp = (t - 0.5) / 0.42
+            n = 16
+            for k in range(n):
+                ang = (k / n) * 2 * math.pi + k * 0.6
+                speed = 340 + (k % 5) * 95
+                r = sp * speed
+                ca, sa = math.cos(ang), math.sin(ang)
+                x2 = cx + ca * r
+                y2 = cy + sa * r * 0.85 - sp * sp * 70
+                x1 = cx + ca * r * 0.84
+                y1 = cy + sa * r * 0.84 * 0.85 - sp * sp * 60
+                if sp < 0.4:
+                    col = "#fff2c0"
+                elif sp < 0.72:
+                    col = "#ff9a3c"
+                else:
+                    col = "#6f3410"
+                add(self.canvas.create_line(
+                    x1, y1, x2, y2,
+                    width=max(1, int(3 * (1 - sp))), fill=col, capstyle="round"))
+
+    # ----- lifecycle -----
+    def _close(self, fade: bool = True) -> None:
+        if self._closing or self._closed:
+            return
+        self._closing = True
+        if fade:
+            self._fade_out(self.TARGET_ALPHA)
+        else:
+            self._destroy()
+
+    def _fade_out(self, alpha: float) -> None:
+        if self._closed:
+            return
+        alpha -= 0.16
+        if alpha <= 0:
+            self._destroy()
+            return
+        try:
+            self.root.attributes("-alpha", alpha)
+        except tk.TclError:
+            self._destroy()
+            return
+        self.root.after(16, lambda: self._fade_out(alpha))
+
+    def _destroy(self) -> None:
         if self._closed:
             return
         self._closed = True
@@ -659,85 +930,29 @@ class WhipAnimation:
         except tk.TclError:
             pass
 
-    def _draw_whip(self, t: float) -> None:
-        for item in self._whip_items:
-            self.canvas.delete(item)
-        self._whip_items.clear()
-
-        head_x = -150 + (self.w + 300) * t
-        head_y = self.h * 0.55 + math.sin(t * math.pi) * (self.h * 0.04)
-        tail_length = self.w * 0.55
-
-        segs = 48
-        points: list[tuple[float, float]] = []
-        for i in range(segs + 1):
-            f = i / segs
-            amp = (1 - t) * 90 + f * 130
-            phase = f * 6.5 + t * 9.5
-            x = head_x - tail_length * f
-            y = head_y + amp * math.sin(phase)
-            points.append((x, y))
-
-        ghost_dx = -40
-        for i in range(len(points) - 1):
-            x1, y1 = points[i]
-            x2, y2 = points[i + 1]
-            f = i / segs
-            width = max(1, 12 * (1 - f) + 2)
-            ghost = self.canvas.create_line(
-                x1 + ghost_dx, y1, x2 + ghost_dx, y2,
-                width=max(1, width - 4), fill="#3a2a10", capstyle="round",
-            )
-            self._whip_items.append(ghost)
-
-        for i in range(len(points) - 1):
-            x1, y1 = points[i]
-            x2, y2 = points[i + 1]
-            f = i / segs
-            width = max(1, 14 * (1 - f) + 2)
-            color = "#fff5d0" if f < 0.05 else ("#e0b070" if f < 0.5 else "#8a5a20")
-            seg = self.canvas.create_line(
-                x1, y1, x2, y2, width=width, fill=color, capstyle="round",
-            )
-            self._whip_items.append(seg)
-
-        if 0.42 < t < 0.62:
-            cx, cy = points[0]
-            flash_progress = (t - 0.42) / 0.20
-            for r, col in ((220, "#fff7c0"), (140, "#ffffff"), (60, "#ffffff")):
-                fr = r * (1.0 + flash_progress * 0.8)
-                self._whip_items.append(
-                    self.canvas.create_oval(
-                        cx - fr, cy - fr, cx + fr, cy + fr,
-                        outline="", fill=col,
-                    )
-                )
-            for ang_deg in range(0, 360, 30):
-                ang = math.radians(ang_deg)
-                r1 = 80 + flash_progress * 50
-                r2 = 200 + flash_progress * 120
-                self._whip_items.append(
-                    self.canvas.create_line(
-                        cx + math.cos(ang) * r1, cy + math.sin(ang) * r1,
-                        cx + math.cos(ang) * r2, cy + math.sin(ang) * r2,
-                        width=4, fill="#ffe680",
-                    )
-                )
-
     def _tick(self) -> None:
-        if self._closed:
+        if self._closing or self._closed:
             return
         elapsed_ms = (time.time() - self._start_time) * 1000
+        try:
+            self.root.attributes(
+                "-alpha", self.TARGET_ALPHA * min(1.0, elapsed_ms / self.FADE_IN_MS)
+            )
+        except tk.TclError:
+            return
         t = min(1.0, elapsed_ms / self.DURATION_MS)
-        self._draw_whip(t)
+        sx, sy = self._compute_shake(t)
+        self._apply_shake(sx, sy)
+        self._draw_whip(t, sx, sy)
+        self._flash_headline(t)
         if t >= 1.0:
-            self.root.after(180, self._close)
+            self.root.after(240, self._close)
             return
         self.root.after(16, self._tick)
 
     def run(self) -> None:
         self.root.after(20, self._tick)
-        self.root.after(self.DURATION_MS + 800, self._close)
+        self.root.after(self.DURATION_MS + 1400, self._close)  # safety net
         self.root.mainloop()
 
 
